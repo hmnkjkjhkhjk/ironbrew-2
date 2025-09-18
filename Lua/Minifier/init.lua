@@ -1,110 +1,87 @@
----------
--- LuaSrcDiet API
-----
+-- LuaSrcDiet API (CLI copy) — with Luau→Lua5.1 normalize step
 
-package.path = package.path .. ";../Lua/Minifier/?.lua"
+-- make sure this folder is on package.path
+local here = (...):gsub("[^%.]+$", "")  -- e.g. "Lua.Minifier."
+package.path = package.path
+  .. ";./?.lua;./?/init.lua"
+  .. ";../Lua/Minifier/?.lua;../Lua/Minifier/?/init.lua"
 
-local llex = require 'llex'
-local lparser = require 'lparser'
-local optlex = require 'optlex'
+local llex      = require 'llex'
+local lparser   = require 'lparser'
+local optlex    = require 'optlex'
 local optparser = require 'optparser'
-local utils = require 'utils'
+local utils     = require 'utils'
+
+-- try both module names so it works no matter where the CLI is run from
+local luaucompat
+do
+  local ok, mod = pcall(require, 'luaucompat')
+  if ok then luaucompat = mod
+  else
+    ok, mod = pcall(require, 'Lua.Minifier.luaucompat')
+    if ok then luaucompat = mod end
+  end
+end
 
 local concat = table.concat
-local merge = utils.merge
+local merge  = utils.merge
 
-local _  -- placeholder
-
-
-local function noop ()
-  return
-end
+local function noop() end
 
 local function opts_to_legacy (opts)
   local res = {}
-  for key, val in pairs(opts) do
-    res['opt-'..key] = val
+  for k, v in pairs(opts) do
+    res['opt-'..k] = v
   end
   return res
 end
 
-
 local M = {}
 
---- The module's name.
-M._NAME = 'luasrcdiet'
-
---- The module's version number.
-M._VERSION = '1.0.0'
-
---- The module's homepage.
+M._NAME     = 'luasrcdiet'
+M._VERSION  = '1.0.0'
 M._HOMEPAGE = 'https://github.com/jirutka/luasrcdiet'
 
---- All optimizations disabled.
 M.NONE_OPTS = {
-  binequiv = false,
-  comments = false,
-  emptylines = false,
-  entropy = false,
-  eols = false,
-  experimental = false,
-  locals = false,
-  numbers = false,
-  srcequiv = false,
-  strings = false,
-  whitespace = false,
+  binequiv=false, comments=false, emptylines=false, entropy=false,
+  eols=false, experimental=false, locals=false, numbers=false,
+  srcequiv=false, strings=false, whitespace=false,
 }
 
---- Basic optimizations enabled.
--- @table BASIC_OPTS
-M.BASIC_OPTS = merge(M.NONE_OPTS, {
-  comments = true,
-  emptylines = true,
-  srcequiv = true,
-  whitespace = true,
-})
+M.BASIC_OPTS   = merge(M.NONE_OPTS, { comments=true, emptylines=true, srcequiv=true, whitespace=true })
+M.DEFAULT_OPTS = merge(M.BASIC_OPTS, { locals=true, numbers=true })
+M.MAXIMUM_OPTS = merge(M.DEFAULT_OPTS, { entropy=true, eols=true, strings=true })
 
---- Defaults.
--- @table DEFAULT_OPTS
-M.DEFAULT_OPTS = merge(M.BASIC_OPTS, {
-  locals = true,
-  numbers = true,
-})
-
---- Maximum optimizations enabled (all except experimental).
--- @table MAXIMUM_OPTS
-M.MAXIMUM_OPTS = merge(M.DEFAULT_OPTS, {
-  entropy = true,
-  eols = true,
-  strings = true,
-})
-
---- Optimizes the given Lua source code.
---
--- @tparam ?{[string]=bool,...} opts Optimizations to do (default is @{DEFAULT_OPTS}).
--- @tparam string source The Lua source code to optimize.
--- @treturn string Optimized source.
--- @raise if the source is malformed, source equivalence test failed, or some
---   other error occured.
 function M.optimize (opts, source)
-  assert(source and type(source) == 'string',
-         'bad argument #2: expected string, got a '..type(source))
+  assert(type(source) == 'string', 'bad argument #2: expected string')
 
   opts = opts and merge(M.NONE_OPTS, opts) or M.DEFAULT_OPTS
   local legacy_opts = opts_to_legacy(opts)
 
+  -- --- Luau → Lua 5.1 normalize (fixes `continue`, `+=`, `..=`, etc.)
+  if luaucompat and luaucompat.normalize then
+    source = luaucompat.normalize(source)
+  else
+    -- last-ditch: warn once so you know if normalize didn’t run
+    print("[luasrcdiet] WARN: luaucompat not found; using raw input (Luau syntax may fail under luac).")
+  end
+
+  -- DEBUG: write normalized source next to the CLI binary
+  local f, err = io.open("normalized.lua", "w")
+  if f then f:write(source); f:close(); print("[luasrcdiet] normalized.lua written") else print("[luasrcdiet] write fail:", err) end
+
+  -- tokenize & parse
   local toklist, seminfolist, toklnlist = llex.lex(source)
   local xinfo = lparser.parse(toklist, seminfolist, toklnlist)
 
+  -- optimize
   optparser.print = noop
   optparser.optimize(legacy_opts, toklist, seminfolist, xinfo)
 
-  local warn = optlex.warn  -- use this as a general warning lookup
   optlex.print = noop
-  _, seminfolist = optlex.optimize(legacy_opts, toklist, seminfolist, toklnlist)
-  local optim_source = concat(seminfolist)
+  local _, seminfolist2 = optlex.optimize(legacy_opts, toklist, seminfolist, toklnlist)
 
-  return optim_source
+  return concat(seminfolist2)
 end
 
 return M
