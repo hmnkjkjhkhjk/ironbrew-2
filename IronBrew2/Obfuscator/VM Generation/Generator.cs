@@ -1,9 +1,7 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Reflection.Emit;
 using System.Text;
 using IronBrew2.Bytecode_Library.Bytecode;
 using IronBrew2.Bytecode_Library.IR;
@@ -12,586 +10,461 @@ using IronBrew2.Obfuscator.Opcodes;
 
 namespace IronBrew2.Obfuscator.VM_Generation
 {
-	public class Generator
-	{
-		private ObfuscationContext _context;
-		
-		public Generator(ObfuscationContext context) =>
-			_context = context;
+    public class Generator
+    {
+        private readonly ObfuscationContext _context;
+        private readonly Random _rng;
 
-		public bool IsUsed(Chunk chunk, VOpcode virt)
-		{
-			bool isUsed = false;
-			foreach (Instruction ins in chunk.Instructions)
-				if (virt.IsInstruction(ins))
-				{
-					if (!_context.InstructionMapping.ContainsKey(ins.OpCode))
-						_context.InstructionMapping.Add(ins.OpCode, virt);
+        public Generator(ObfuscationContext context)
+        {
+            _context = context;
+            _rng = new Random(Environment.TickCount);
+        }
 
-					ins.CustomData = new CustomInstructionData {Opcode = virt};
-					isUsed = true;
-				}
+        public bool IsUsed(Chunk chunk, VOpcode virt)
+        {
+            bool used = false;
+            foreach (Instruction ins in chunk.Instructions)
+            {
+                if (virt.IsInstruction(ins))
+                {
+                    if (!_context.InstructionMapping.ContainsKey(ins.OpCode))
+                        _context.InstructionMapping.Add(ins.OpCode, virt);
+                    ins.CustomData = new CustomInstructionData { Opcode = virt };
+                    used = true;
+                }
+            }
+            foreach (Chunk s in chunk.Functions)
+                used |= IsUsed(s, virt);
+            return used;
+        }
 
-			foreach (Chunk sChunk in chunk.Functions)
-				isUsed |= IsUsed(sChunk, virt);
+        public static List<int> Compress(byte[] uncompressed)
+        {
+            var dict = new Dictionary<string, int>();
+            for (int i = 0; i < 256; i++) dict.Add(((char)i).ToString(), i);
+            string w = string.Empty;
+            var outLzw = new List<int>();
+            foreach (byte b in uncompressed)
+            {
+                string wc = w + (char)b;
+                if (dict.ContainsKey(wc)) w = wc;
+                else { outLzw.Add(dict[w]); dict.Add(wc, dict.Count); w = ((char)b).ToString(); }
+            }
+            if (!string.IsNullOrEmpty(w)) outLzw.Add(dict[w]);
+            return outLzw;
+        }
 
-			return isUsed;
-		}
-
-		public static List<int> Compress(byte[] uncompressed)
-		{
-			// build the dictionary
-			Dictionary<string, int> dictionary = new Dictionary<string, int>();
-			for (int i = 0; i < 256; i++)
-				dictionary.Add(((char)i).ToString(), i);
- 
-			string    w          = string.Empty;
-			List<int> compressed = new List<int>();
- 
-			foreach (byte b in uncompressed)
-			{
-				string wc = w + (char)b;
-				if (dictionary.ContainsKey(wc))
-					w = wc;
-				
-				else
-				{
-					// write w to output
-					compressed.Add(dictionary[w]);
-					// wc is a new sequence; add it to the dictionary
-					dictionary.Add(wc, dictionary.Count);
-					w = ((char) b).ToString();
-				}
-			}
- 
-			// write remaining output if necessary
-			if (!string.IsNullOrEmpty(w))
-				compressed.Add(dictionary[w]);
- 
-			return compressed;
-		}
-
-		public static string ToBase36(ulong value)
+        public static string ToBase36(ulong value)
         {
             const string base36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
             var sb = new StringBuilder(13);
-            do
-            {
-                sb.Insert(0, base36[(byte)(value % 36)]);
-                value /= 36;
-            } while (value != 0);
+            do { sb.Insert(0, base36[(byte)(value % 36)]); value /= 36; } while (value != 0);
             return sb.ToString();
         }
 
-		public static string CompressedToString(List<int> compressed)
-		{
-			StringBuilder sb = new StringBuilder();
-			foreach (int i in compressed)
-			{
-				string n = ToBase36((ulong)i);
-				
-				sb.Append(ToBase36((ulong)n.Length));
-				sb.Append(n);
-			}
+        public static string CompressedToString(List<int> compressed)
+        {
+            var sb = new StringBuilder();
+            foreach (int i in compressed)
+            {
+                string n = ToBase36((ulong)i);
+                sb.Append(ToBase36((ulong)n.Length));
+                sb.Append(n);
+            }
+            return sb.ToString();
+        }
 
-			return sb.ToString();
-		}
+        public List<OpMutated> GenerateMutations(List<VOpcode> opcodes)
+        {
+            var r = _rng;
+            var mutated = new List<OpMutated>();
+            foreach (var opc in opcodes)
+            {
+                if (opc is OpSuperOperator) continue;
+                for (int i = 0; i < r.Next(35, 50); i++)
+                {
+                    int[] rand = { 0, 1, 2 };
+                    rand.Shuffle();
+                    mutated.Add(new OpMutated { Registers = rand, Mutated = opc });
+                }
+            }
+            mutated.Shuffle();
+            return mutated;
+        }
 
-		public List<OpMutated> GenerateMutations(List<VOpcode> opcodes)
-		{
-			Random r = new Random();
-			List<OpMutated> mutated = new List<OpMutated>();
+        public void FoldMutations(List<OpMutated> mutations, HashSet<OpMutated> chosen, Chunk chunk)
+        {
+            bool[] skip = new bool[chunk.Instructions.Count + 1];
 
-			foreach (VOpcode opc in opcodes)
-			{
-				if (opc is OpSuperOperator)
-					continue;
+            for (int i = 0; i < chunk.Instructions.Count; i++)
+            {
+                Instruction ins = chunk.Instructions[i];
+                if (ins.OpCode == Opcode.Closure)
+                    for (int j = 1; j <= ((Chunk)ins.RefOperands[0]).UpvalueCount; j++)
+                        skip[i + j] = true;
+            }
 
-				for (int i = 0; i < r.Next(35, 50); i++)
-				{
-					int[] rand = {0, 1, 2};
-					rand.Shuffle();
+            for (int i = 0; i < chunk.Instructions.Count; i++)
+            {
+                if (skip[i]) continue;
+                var data = chunk.Instructions[i].CustomData;
+                foreach (var mut in mutations)
+                    if (data.Opcode == mut.Mutated && data.WrittenOpcode == null)
+                    {
+                        if (!chosen.Contains(mut)) chosen.Add(mut);
+                        data.Opcode = mut;
+                        break;
+                    }
+            }
 
-					OpMutated mut = new OpMutated();
+            foreach (Chunk s in chunk.Functions)
+                FoldMutations(mutations, chosen, s);
+        }
 
-					mut.Registers = rand;
-					mut.Mutated = opc;
-						
-					mutated.Add(mut);
-				}
-			}
+        public List<OpSuperOperator> GenerateSuperOperators(Chunk chunk, int maxSize, int minSize = 5)
+        {
+            var results = new List<OpSuperOperator>();
+            bool[] skip = new bool[chunk.Instructions.Count + 1];
 
-			mutated.Shuffle();
-			return mutated;
-		}
+            for (int i = 0; i < chunk.Instructions.Count - 1; i++)
+            {
+                switch (chunk.Instructions[i].OpCode)
+                {
+                    case Opcode.Closure:
+                        skip[i] = true;
+                        for (int j = 0; j < ((Chunk)chunk.Instructions[i].RefOperands[0]).UpvalueCount; j++)
+                            skip[i + j + 1] = true;
+                        break;
+                    case Opcode.Eq:
+                    case Opcode.Lt:
+                    case Opcode.Le:
+                    case Opcode.Test:
+                    case Opcode.TestSet:
+                    case Opcode.TForLoop:
+                    case Opcode.SetList:
+                    case Opcode.LoadBool when chunk.Instructions[i].C != 0:
+                        skip[i + 1] = true;
+                        break;
+                    case Opcode.ForLoop:
+                    case Opcode.ForPrep:
+                    case Opcode.Jmp:
+                        chunk.Instructions[i].UpdateRegisters();
+                        skip[i + 1] = true;
+                        skip[i + chunk.Instructions[i].B + 1] = true;
+                        break;
+                }
+                if (chunk.Instructions[i].CustomData.WrittenOpcode is OpSuperOperator su && su.SubOpcodes != null)
+                    for (int j = 0; j < su.SubOpcodes.Length; j++)
+                        skip[i + j] = true;
+            }
 
-		public void FoldMutations(List<OpMutated> mutations, HashSet<OpMutated> used, Chunk chunk)
-		{
-			bool[] skip = new bool[chunk.Instructions.Count + 1];
-			
-			for (int i = 0; i < chunk.Instructions.Count; i++)
-			{
-				Instruction opc = chunk.Instructions[i];
+            int c = 0;
+            while (c < chunk.Instructions.Count)
+            {
+                int target = maxSize;
+                var so = new OpSuperOperator { SubOpcodes = new VOpcode[target] };
+                bool direct = true;
+                int cut = target;
 
-				switch (opc.OpCode)
-				{
-					case Opcode.Closure:
-						for (int j = 1; j <= ((Chunk) opc.RefOperands[0]).UpvalueCount; j++)
-							skip[i + j] = true;
+                for (int j = 0; j < target; j++)
+                    if (c + j > chunk.Instructions.Count - 1 || skip[c + j]) { cut = j; direct = false; break; }
 
-						break;
-				}
-			}
-			
-			for (int i = 0; i < chunk.Instructions.Count; i++)
-			{
-				if (skip[i])
-					continue;
-				
-				Instruction opc = chunk.Instructions[i];
-				CustomInstructionData data = opc.CustomData;
-				
-				foreach (OpMutated mut in mutations)
-					if (data.Opcode == mut.Mutated && data.WrittenOpcode == null)
-					{
-						if (!used.Contains(mut))
-							used.Add(mut);
+                if (!direct)
+                {
+                    if (cut < minSize) { c += cut + 1; continue; }
+                    target = cut;
+                    so = new OpSuperOperator { SubOpcodes = new VOpcode[target] };
+                }
 
-						data.Opcode = mut;
-						break;
-					}
-			}
-			
-			foreach (Chunk _c in chunk.Functions)
-				FoldMutations(mutations, used, _c);
-		}
+                for (int j = 0; j < target; j++)
+                    so.SubOpcodes[j] = chunk.Instructions[c + j].CustomData.Opcode;
 
-		public List<OpSuperOperator> GenerateSuperOperators(Chunk chunk, int maxSize, int minSize = 5)
-		{
-			List<OpSuperOperator> results = new List<OpSuperOperator>();
-			Random                r       = new Random();
+                results.Add(so);
+                c += target + 1;
+            }
 
-			bool[] skip = new bool[chunk.Instructions.Count + 1];
+            foreach (var f in chunk.Functions)
+                results.AddRange(GenerateSuperOperators(f, maxSize, minSize));
 
-			for (int i = 0; i < chunk.Instructions.Count - 1; i++)
-			{
-				switch (chunk.Instructions[i].OpCode)
-				{
-					case Opcode.Closure:
-					{
-						skip[i] = true;
-						for (int j = 0; j < ((Chunk) chunk.Instructions[i].RefOperands[0]).UpvalueCount; j++)
-							skip[i + j + 1] = true;
-							
-						break;
-					}
+            return results;
+        }
 
-					case Opcode.Eq:
-					case Opcode.Lt:
-					case Opcode.Le:
-					case Opcode.Test:
-					case Opcode.TestSet:
-					case Opcode.TForLoop:
-					case Opcode.SetList:
-					case Opcode.LoadBool when chunk.Instructions[i].C != 0:
-						skip[i + 1] = true;
-						break;
+        public void FoldAdditionalSuperOperators(Chunk chunk, List<OpSuperOperator> ops, ref int folded)
+        {
+            bool[] skip = new bool[chunk.Instructions.Count + 1];
 
-					case Opcode.ForLoop:
-					case Opcode.ForPrep:
-					case Opcode.Jmp:
-						chunk.Instructions[i].UpdateRegisters();
-						
-						skip[i + 1] = true;
-						skip[i + chunk.Instructions[i].B + 1] = true;
-						break;
-				}
-				
-				if (chunk.Instructions[i].CustomData.WrittenOpcode is OpSuperOperator su && su.SubOpcodes != null)
-					for (int j = 0; j < su.SubOpcodes.Length; j++)
-						skip[i + j] = true;
-			}
-			
-			int c = 0;
-			while (c < chunk.Instructions.Count)
-			{
-				int targetCount = maxSize;
-				OpSuperOperator superOperator = new OpSuperOperator {SubOpcodes = new VOpcode[targetCount]};
+            for (int i = 0; i < chunk.Instructions.Count - 1; i++)
+            {
+                switch (chunk.Instructions[i].OpCode)
+                {
+                    case Opcode.Closure:
+                        skip[i] = true;
+                        for (int j = 0; j < ((Chunk)chunk.Instructions[i].RefOperands[0]).UpvalueCount; j++)
+                            skip[i + j + 1] = true;
+                        break;
+                    case Opcode.Eq:
+                    case Opcode.Lt:
+                    case Opcode.Le:
+                    case Opcode.Test:
+                    case Opcode.TestSet:
+                    case Opcode.TForLoop:
+                    case Opcode.SetList:
+                    case Opcode.LoadBool when chunk.Instructions[i].C != 0:
+                        skip[i + 1] = true;
+                        break;
+                    case Opcode.ForLoop:
+                    case Opcode.ForPrep:
+                    case Opcode.Jmp:
+                        chunk.Instructions[i].UpdateRegisters();
+                        skip[i + 1] = true;
+                        skip[i + chunk.Instructions[i].B + 1] = true;
+                        break;
+                }
+                if (chunk.Instructions[i].CustomData.WrittenOpcode is OpSuperOperator su && su.SubOpcodes != null)
+                    for (int j = 0; j < su.SubOpcodes.Length; j++)
+                        skip[i + j] = true;
+            }
 
-				bool d     = true;
-				int cutoff = targetCount;
+            int c = 0;
+            while (c < chunk.Instructions.Count)
+            {
+                if (skip[c]) { c++; continue; }
+                bool used = false;
 
-				for (int j = 0; j < targetCount; j++)
-					if (c + j > chunk.Instructions.Count - 1 || skip[c + j])
-					{
-						cutoff = j; 
-						d = false;
-						break;
-					}
+                foreach (var op in ops)
+                {
+                    int target = op.SubOpcodes.Length;
+                    bool contig = true;
+                    for (int j = 0; j < target; j++)
+                    {
+                        if (c + j > chunk.Instructions.Count - 1 || skip[c + j]) { contig = false; break; }
+                    }
+                    if (!contig) continue;
 
-				if (!d)
-				{
-					if (cutoff < minSize)
-					{
-						c += cutoff + 1;	
-						continue;
-					}
-						
-					targetCount = cutoff;	
-					superOperator = new OpSuperOperator {SubOpcodes = new VOpcode[targetCount]};
-				}
-				
-				for (int j = 0; j < targetCount; j++)
-					superOperator.SubOpcodes[j] =
-						chunk.Instructions[c + j].CustomData.Opcode;
+                    var taken = chunk.Instructions.Skip(c).Take(target).ToList();
+                    if (op.IsInstruction(taken))
+                    {
+                        for (int j = 0; j < target; j++)
+                        {
+                            skip[c + j] = true;
+                            chunk.Instructions[c + j].CustomData.WrittenOpcode = new OpSuperOperator { VIndex = 0 };
+                        }
+                        chunk.Instructions[c].CustomData.WrittenOpcode = op;
+                        used = true;
+                        break;
+                    }
+                }
 
-				results.Add(superOperator);
-				c += targetCount + 1;
-			}
+                if (!used) c++; else folded++;
+            }
 
-			foreach (var _c in chunk.Functions)
-				results.AddRange(GenerateSuperOperators(_c, maxSize));
-			
-			return results;
-		}
+            foreach (var f in chunk.Functions)
+                FoldAdditionalSuperOperators(f, ops, ref folded);
+        }
 
-		public void FoldAdditionalSuperOperators(Chunk chunk, List<OpSuperOperator> operators, ref int folded)
-		{
-			bool[] skip = new bool[chunk.Instructions.Count + 1];
-			for (int i = 0; i < chunk.Instructions.Count - 1; i++)
-			{
-				switch (chunk.Instructions[i].OpCode)
-				{
-					case Opcode.Closure:
-					{
-						skip[i] = true;
-						for (int j = 0; j < ((Chunk) chunk.Instructions[i].RefOperands[0]).UpvalueCount; j++)
-							skip[i + j + 1] = true;
-							
-						break;
-					}
+        private string WrapHandlerPolymorphic(string body, int variant, int a, int b)
+        {
+            if (variant == 0)
+                return $@"do local t=(Enum%{a})+1 if ((t%2)==((t*{b})%2)) then (function(){body} end)() else (function(){body} end)() end end";
+            else if (variant == 1)
+                return $@"do local g=0 local function s1() g=(bx(Enum,_mk)%{a}) end local function s2() if (((g+1)%2)==1) then {body} else {body} end end s1() s2() end";
+            else
+                return $@"do local v={{}} local f1=function(){body} end local f2=function(){body} end v[1]=f1 v[2]=f2 local i=((bx(Enum,_mk)+{a})%2)+1 v[i]() end";
+        }
 
-					case Opcode.Eq:
-					case Opcode.Lt:
-					case Opcode.Le:
-					case Opcode.Test:
-					case Opcode.TestSet:
-					case Opcode.TForLoop:
-					case Opcode.SetList:
-					case Opcode.LoadBool when chunk.Instructions[i].C != 0:
-						skip[i + 1] = true;
-						break;
+        public string GenerateVM(ObfuscationSettings settings)
+        {
+            int seed0 = Environment.TickCount;
+            int key = _context.PrimaryXorKey & 0xFF;
+            const uint GOLD = 0x9E3779B9u;
+            uint mix = ((uint)key) * GOLD;
+            int seed = unchecked(seed0 ^ (int)mix);
 
-					case Opcode.ForLoop:
-					case Opcode.ForPrep:
-					case Opcode.Jmp:
-						chunk.Instructions[i].UpdateRegisters();
-						skip[i + 1] = true;
-						skip[i + chunk.Instructions[i].B + 1] = true;
-						break;
-				}
-				
-				if (chunk.Instructions[i].CustomData.WrittenOpcode is OpSuperOperator su && su.SubOpcodes != null)
-					for (int j = 0; j < su.SubOpcodes.Length; j++)
-						skip[i + j] = true;
-			}
-			
-			int c = 0;
-			while (c < chunk.Instructions.Count)
-			{
-				if (skip[c])
-				{
-					c++;
-					continue;
-				}
+            var r = _rng;
 
-				bool used = false;
+            var virtuals = Assembly.GetExecutingAssembly()
+                .GetTypes()
+                .Where(t => t.IsSubclassOf(typeof(VOpcode)))
+                .Select(Activator.CreateInstance)
+                .Cast<VOpcode>()
+                .Where(t => IsUsed(_context.HeadChunk, t))
+                .ToList();
 
-				foreach (OpSuperOperator op in operators)
-				{
-					int targetCount = op.SubOpcodes.Length;
-					bool cu = true;
-					for (int j = 0; j < targetCount; j++)
-					{
-						if (c + j > chunk.Instructions.Count - 1 || skip[c + j])
-						{
-							cu = false;
-							break;
-						}
-					}
+            if (settings.Mutate)
+            {
+                var muts = GenerateMutations(virtuals).Take(settings.MaxMutations).ToList();
+                var chosen = new HashSet<OpMutated>();
+                FoldMutations(muts, chosen, _context.HeadChunk);
+                virtuals.AddRange(chosen);
+            }
 
-					if (!cu)
-						continue;
+            if (settings.SuperOperators)
+            {
+                int folded = 0;
 
+                var mega = GenerateSuperOperators(_context.HeadChunk, 80, 60).OrderBy(_ => r.Next())
+                    .Take(settings.MaxMegaSuperOperators).ToList();
+                virtuals.AddRange(mega);
+                FoldAdditionalSuperOperators(_context.HeadChunk, mega, ref folded);
 
-					List<Instruction> taken = chunk.Instructions.Skip(c).Take(targetCount).ToList();
-					if (op.IsInstruction(taken))
-					{
-						for (int j = 0; j < targetCount; j++)
-						{
-							skip[c + j] = true;
-							chunk.Instructions[c + j].CustomData.WrittenOpcode = new OpSuperOperator {VIndex = 0};
-						}
+                var mini = GenerateSuperOperators(_context.HeadChunk, 12, 7).OrderBy(_ => r.Next())
+                    .Take(settings.MaxMiniSuperOperators).ToList();
+                virtuals.AddRange(mini);
+                FoldAdditionalSuperOperators(_context.HeadChunk, mini, ref folded);
+            }
 
-						chunk.Instructions[c].CustomData.WrittenOpcode = op;
+            virtuals.Shuffle();
+            int n = virtuals.Count;
+            int[] realToFake = Enumerable.Range(0, n).OrderBy(_ => r.Next()).ToArray();
+            int[] fakeToReal = new int[n];
+            for (int i = 0; i < n; i++) fakeToReal[realToFake[i]] = i;
+            for (int i = 0; i < n; i++) virtuals[i].VIndex = realToFake[i];
+            string mapLua = "{" + string.Join(",", fakeToReal.Select(v => v.ToString())) + "}";
 
-						used = true;
-						break;
-					}
-				}
+            byte[] bs = new Serializer(_context, settings).SerializeLChunk(_context.HeadChunk);
 
-				if (!used)
-					c++;
-				else
-					folded++;
-			}
+            ulong checksum = 0UL;
+            for (int i = 0; i < bs.Length; i++)
+                checksum = (checksum + (ulong)bs[i]) & 0xFFFFFFFFUL;
 
-			foreach (var _c in chunk.Functions)
-				FoldAdditionalSuperOperators(_c, operators, ref folded);
-		}
-		
-		public string GenerateVM(ObfuscationSettings settings)
-		{
-			Random r = new Random();
+            var vm = new StringBuilder();
+            vm.Append(@"
+local b=string.byte
+local c=string.char
+local s=string.sub
+local tc=table.concat
+local ld=math.ldexp
+local gf=getfenv or function() return _ENV end
+local sf=select
+local up=unpack or table.unpack
+");
 
-			List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
-			                                 .Where(t => t.IsSubclassOf(typeof(VOpcode)))
-			                                 .Select(Activator.CreateInstance)
-			                                 .Cast<VOpcode>()
-			                                 .Where(t => IsUsed(_context.HeadChunk, t))
-			                                 .ToList();
+            if (settings.BytecodeCompress)
+            {
+                vm.Append(@"local function d0(bx)local c1,d1,e1='', '', {} local f1=256 local g1={} for h1=0,f1-1 do g1[h1]=c(h1) end local i1=1 local function b36(len) local n=0 for j1=0,len-1 do local ch=b(bx,i1+j1) local v if ch>=48 and ch<=57 then v=ch-48 elseif ch>=65 and ch<=90 then v=ch-55 elseif ch>=97 and ch<=122 then v=ch-87 else v=0 end n=n*36+v end i1=i1+len return n end local function k() local l=b36(1) local m=b36(l) return m end c1=c(k()) e1[1]=c1 while i1<#bx do local n2=k() if g1[n2] then d1=g1[n2] else d1=c1..s(c1,1,1) end g1[f1]=c1..s(d1,1,1) e1[#e1+1],c1,f1=d1,d1,f1+1 end return table.concat(e1) end;");
+                vm.Append("local p0={};");
+                int parts = Math.Max(2, Math.Min(6, bs.Length / 1024));
+                int chunk = (int)Math.Ceiling(bs.Length / (double)parts);
 
-			
-			if (settings.Mutate)
-			{
-				List<OpMutated> muts = GenerateMutations(virtuals).Take(settings.MaxMutations).ToList();
-				
-				Console.WriteLine("Created " + muts.Count + " mutations.");
-				
-				HashSet<OpMutated> used = new HashSet<OpMutated>();
-				FoldMutations(muts, used, _context.HeadChunk);
-				
-				Console.WriteLine("Used " + used.Count + " mutations.");
-				
-				virtuals.AddRange(used);
-			}
-			
-			if (settings.SuperOperators)
-			{
-				int folded = 0;
-				
-				var megaOperators = GenerateSuperOperators(_context.HeadChunk, 80, 60).OrderBy(t => r.Next())
-					.Take(settings.MaxMegaSuperOperators).ToList();
-				
-				Console.WriteLine("Created " + megaOperators.Count + " mega super operators.");
-				
-				virtuals.AddRange(megaOperators);
-				
-				FoldAdditionalSuperOperators(_context.HeadChunk, megaOperators, ref folded);
-				
-				var miniOperators = GenerateSuperOperators(_context.HeadChunk, 10).OrderBy(t => r.Next())
-					.Take(settings.MaxMiniSuperOperators).ToList();
-				
-				Console.WriteLine("Created " + miniOperators.Count + " mini super operators.");
-				
-				virtuals.AddRange(miniOperators);
-				
-				FoldAdditionalSuperOperators(_context.HeadChunk, miniOperators, ref folded);
-				
-				Console.WriteLine("Folded " + folded + " instructions into super operators.");
-			}
-			
-			virtuals.Shuffle();
-			
-			for (int i = 0; i < virtuals.Count; i++)
-				virtuals[i].VIndex = i;
+                for (int pi = 0; pi < parts; pi++)
+                {
+                    int start = pi * chunk;
+                    int len = Math.Min(chunk, bs.Length - start);
+                    if (len <= 0) break;
 
-			string vm = "";
+                    byte[] seg = new byte[len];
+                    Buffer.BlockCopy(bs, start, seg, 0, len);
 
-			byte[] bs = new Serializer(_context, settings).SerializeLChunk(_context.HeadChunk);
-			
-			vm += @"
-local Byte         = string.byte;
-local Char         = string.char;
-local Sub          = string.sub;
-local Concat       = table.concat;
-local Insert       = table.insert;
-local LDExp        = math.ldexp;
-local GetFEnv      = getfenv or function() return _ENV end;
-local Setmetatable = setmetatable;
-local Select       = select;
+                    string enc = CompressedToString(Compress(seg));
+                    vm.Append($"p0[#p0+1]=d0('{enc}');");
+                }
 
-local Unpack = unpack or table.unpack;
-local ToNumber = tonumber;";
+                vm.Append("__bs=table.concat(p0);");
+            }
+            else
+            {
+                vm.Append("local p0={};");
+                int parts = Math.Max(2, Math.Min(6, bs.Length / 1024));
+                int chunk = (int)Math.Ceiling(bs.Length / (double)parts);
 
-			if (settings.BytecodeCompress)
-			{
-				vm += "local function decompress(b)local c,d,e=\"\",\"\",{}local f=256;local g={}for h=0,f-1 do g[h]=Char(h)end;local i=1;local function k()local l=ToNumber(Sub(b, i,i),36)i=i+1;local m=ToNumber(Sub(b, i,i+l-1),36)i=i+l;return m end;c=Char(k())e[1]=c;while i<#b do local n=k()if g[n]then d=g[n]else d=c..Sub(c, 1,1)end;g[f]=c..Sub(d, 1,1)e[#e+1],c,f=d,d,f+1 end;return table.concat(e)end;";
-				vm += "local ByteString=decompress('" + CompressedToString(Compress(bs)) + "');\n";
-			}
-			else
-			{
-				vm += "ByteString='";
+                for (int pi = 0; pi < parts; pi++)
+                {
+                    int start = pi * chunk;
+                    int len = Math.Min(chunk, bs.Length - start);
+                    if (len <= 0) break;
 
-				StringBuilder sb = new StringBuilder();
-				foreach (byte b in bs)
-				{
-					sb.Append('\\');
-					sb.Append(b);
-				}
+                    var sbSeg = new StringBuilder();
+                    for (int k = 0; k < len; k++)
+                    {
+                        sbSeg.Append('\\');
+                        sbSeg.Append(((int)bs[start + k]).ToString());
+                    }
+                    vm.Append($"p0[#p0+1]='{sbSeg}';");
+                }
+                vm.Append("__bs=table.concat(p0);");
+            }
 
-				vm += sb + "';\n";
-			}
+            string vmp1 = VMStrings.VMP1
+                .Replace("CONST_BOOL", _context.ConstantMapping[1].ToString())
+                .Replace("CONST_FLOAT", _context.ConstantMapping[2].ToString())
+                .Replace("CONST_STRING", _context.ConstantMapping[3].ToString());
+            vm.Append(vmp1);
 
-			int maxConstants = 0;
+            for (int i = 0; i < (int)ChunkStep.StepCount; i++)
+            {
+                switch (_context.ChunkSteps[i])
+                {
+                    case ChunkStep.ParameterCount:
+                        vm.Append("Chunk[3]=n8();");
+                        break;
 
-			void ComputeConstants(Chunk c)
-			{
-				if (c.Constants.Count > maxConstants)
-					maxConstants = c.Constants.Count;
-				
-				foreach (Chunk _c in c.Functions)
-					ComputeConstants(_c);
-			}
-			
-			ComputeConstants(_context.HeadChunk);
+                    case ChunkStep.Instructions:
+                        vm.Append("for Idx=1,n32() do local D=n8() if (gb(D,1,1)==0) then local T=gb(D,2,3) local M=gb(D,4,6) local Inst={ n16(), n16(), nil, nil } if (T==0) then Inst[OP_B]=n16() Inst[OP_C]=n16() elseif(T==1) then Inst[OP_B]=n32() elseif(T==2) then Inst[OP_B]=n32()-(2^16) elseif(T==3) then Inst[OP_B]=n32()-(2^16) Inst[OP_C]=n16() end if (gb(M,1,1)==1) then Inst[OP_A]=Consts[Inst[OP_A]] end if (gb(M,2,2)==1) then Inst[OP_B]=Consts[Inst[OP_B]] end if (gb(M,3,3)==1) then Inst[OP_C]=Consts[Inst[OP_C]] end Instrs[Idx]=Inst end end;");
+                        break;
 
-			vm += VMStrings.VMP1
-				.Replace("XOR_KEY", _context.PrimaryXorKey.ToString())
-				.Replace("CONST_BOOL", _context.ConstantMapping[1].ToString())
-				.Replace("CONST_FLOAT", _context.ConstantMapping[2].ToString())
-				.Replace("CONST_STRING", _context.ConstantMapping[3].ToString());
-			
-			for (int i = 0; i < (int) ChunkStep.StepCount; i++)
-			{
-				switch (_context.ChunkSteps[i])
-				{
-					case ChunkStep.ParameterCount:
-						vm += "Chunk[3] = gBits8();";
-						break;
-					case ChunkStep.Instructions:
-						vm +=
-							$@"for Idx=1,gBits32() do 
-									local Descriptor = gBits8();
-									if (gBit(Descriptor, 1, 1) == 0) then
-										local Type = gBit(Descriptor, 2, 3);
-										local Mask = gBit(Descriptor, 4, 6);
-										
-										local Inst=
-										{{
-											gBits16(),
-											gBits16(),
-											nil,
-											nil
-										}};
-	
-										if (Type == 0) then 
-											Inst[OP_B] = gBits16(); 
-											Inst[OP_C] = gBits16();
-										elseif(Type==1) then 
-											Inst[OP_B] = gBits32();
-										elseif(Type==2) then 
-											Inst[OP_B] = gBits32() - (2 ^ 16)
-										elseif(Type==3) then 
-											Inst[OP_B] = gBits32() - (2 ^ 16)
-											Inst[OP_C] = gBits16();
-										end;
-	
-										if (gBit(Mask, 1, 1) == 1) then Inst[OP_A] = Consts[Inst[OP_A]] end
-										if (gBit(Mask, 2, 2) == 1) then Inst[OP_B] = Consts[Inst[OP_B]] end
-										if (gBit(Mask, 3, 3) == 1) then Inst[OP_C] = Consts[Inst[OP_C]] end
-										
-										Instrs[Idx] = Inst;
-									end
-								end;";
-						break;
-					case ChunkStep.Functions:
-						vm += "for Idx=1,gBits32() do Functions[Idx-1]=Deserialize();end;";
-						break;
-					case ChunkStep.LineInfo:
-						if (settings.PreserveLineInfo)
-							vm += "for Idx=1,gBits32() do Lines[Idx]=gBits32();end;";
-						break;
-				}
-			}
+                    case ChunkStep.Functions:
+                        vm.Append("for Idx=1,n32() do Functions[Idx-1]=Deserialize() end;");
+                        break;
 
-			vm += "return Chunk;end;";
-			vm += settings.PreserveLineInfo ? VMStrings.VMP2_LI : VMStrings.VMP2;
+                    case ChunkStep.LineInfo:
+                        if (settings.PreserveLineInfo)
+                            vm.Append("for Idx=1,n32() do Lines[Idx]=n32() end;");
+                        break;
+                }
+            }
 
-			int maxFunc = 0;
+            vm.Append("return Chunk;end;");
+            vm.Append(settings.PreserveLineInfo ? VMStrings.VMP2_LI : VMStrings.VMP2);
 
-			void ComputeFuncs(Chunk c)
-			{
-				if (c.Functions.Count > maxFunc)
-					maxFunc = c.Functions.Count;
-				
-				foreach (Chunk _c in c.Functions)
-					ComputeFuncs(_c);
-			}
-			
-			ComputeFuncs(_context.HeadChunk);
+            int MK = _rng.Next(1, 65521);
+            int ADD = _rng.Next(0, 65521);
+            int MUL = _rng.Next(1, 32768) * 2 + 1;
+            const int MOD = 65521;
 
-			int maxInstrs = 0;
+            vm.Append($@"
+if not __t then
+  _mk,_mu,_ad,_md={MK},{MUL},{ADD},{MOD}
+  __idx=function(e) return ((bx(e,_mk))*_mu+_ad)%_md end
+  __t={{}}");
 
-			void ComputeInstrs(Chunk c)
-			{
-				if (c.Instructions.Count > maxInstrs)
-					maxInstrs = c.Instructions.Count;
-				
-				foreach (Chunk _c in c.Functions)
-					ComputeInstrs(_c);
-			}
-			
-			ComputeInstrs(_context.HeadChunk);
-			
-			string GetStr(List<int> opcodes)
-			{
-				string str = "";
-				
-				if (opcodes.Count == 1)
-					str += $"{virtuals[opcodes[0]].GetObfuscated(_context)}";
+            for (int real = 0; real < n; real++)
+            {
+                string body = virtuals[real].GetObfuscated(_context);
+                int a = _rng.Next(5, 17);
+                int b2 = _rng.Next(3, 11);
+                int variant = _rng.Next(0, 3);
+                string wrapped = WrapHandlerPolymorphic(body, variant, a, b2);
+                vm.Append($"__t[__idx({real})]=function(){wrapped} end;");
+            }
 
-				else if (opcodes.Count == 2) 
-				{
-					if (r.Next(2) == 0)
-					{
-						str +=
-							$"if Enum > {virtuals[opcodes[0]].VIndex} then {virtuals[opcodes[1]].GetObfuscated(_context)}";
-						str += $"else {virtuals[opcodes[0]].GetObfuscated(_context)}";
-						str += "end;";
-					}
-					else
-					{
-						str +=
-							$"if Enum == {virtuals[opcodes[0]].VIndex} then {virtuals[opcodes[0]].GetObfuscated(_context)}";
-						str += $"else {virtuals[opcodes[1]].GetObfuscated(_context)}";
-						str += "end;";
-					}
-				}
-				else
-				{
-					List<int> ordered = opcodes.OrderBy(o => o).ToList();
-					var sorted = new[] { ordered.Take(ordered.Count / 2).ToList(), ordered.Skip(ordered.Count / 2).ToList() };
-					
-					str += "if Enum <= " + sorted[0].Last() + " then ";
-					str += GetStr(sorted[0]);
-					str += " else";
-					str += GetStr(sorted[1]);
-				}
+            int dummies = Math.Min(12, Math.Max(3, n / 4));
+            var usedDummyKeys = new HashSet<int>();
+            for (int i = 0; i < dummies; i++)
+            {
+                int fakeKey = _rng.Next(0, 65521);
+                if (usedDummyKeys.Contains(fakeKey)) { i--; continue; }
+                usedDummyKeys.Add(fakeKey);
+                vm.Append($"__t[{fakeKey}]=function() local z=0 z=z end;");
+            }
+            vm.Append("end;");
 
-				return str;
-			}
+            vm.Append("local __h=__t and __idx and __t[__idx(Enum)] if type(__h)=='function' then __h() else error('bad') end;");
+            vm.Append(settings.PreserveLineInfo ? VMStrings.VMP3_LI : VMStrings.VMP3);
 
-			vm += GetStr(Enumerable.Range(0, virtuals.Count).ToList());
-			vm += settings.PreserveLineInfo ? VMStrings.VMP3_LI : VMStrings.VMP3;
+            string outLua = vm.ToString()
+                .Replace("OP_ENUM", "1")
+                .Replace("OP_A", "2")
+                .Replace("OP_B", "3")
+                .Replace("OP_C", "4")
+                .Replace("__KS_ENABLE__", "0")
+                .Replace("__KS_SEED__", seed.ToString())
+                .Replace("__TAMPER_ON__", "1")
+                .Replace("__CHECKSUM__", ((int)checksum).ToString())
+                .Replace("__MAP__", mapLua)
+                .Replace("__XK__", (_context.PrimaryXorKey & 0xFF).ToString());
 
-			vm = vm.Replace("OP_ENUM", "1")
-				.Replace("OP_A", "2")
-				.Replace("OP_B", "3")
-				.Replace("OP_C", "4");
-
-			
-			return vm;
-		}
-	}
+            return outLua;
+        }
+    }
 }
